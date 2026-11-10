@@ -55,6 +55,7 @@ Custom ``FetcherInterface`` implementations are possible. The alternative
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import logging
 import os
 import shutil
@@ -64,9 +65,23 @@ from typing import TYPE_CHECKING, cast
 from urllib import parse
 
 from tuf.api import exceptions
-from tuf.api.metadata import Root, Snapshot, TargetFile, Targets, Timestamp
+from tuf.api.metadata import (
+    Delegations,
+    Root,
+    Snapshot,
+    TargetFile,
+    Targets,
+    Timestamp,
+)
 from tuf.ngclient._internal.trusted_metadata_set import TrustedMetadataSet
 from tuf.ngclient.config import EnvelopeType, UpdaterConfig
+from tuf.ngclient.trace import (
+    DelegationCondition,
+    LookupOutcome,
+    TargetLookupTrace,
+    TraceEvent,
+    TraceEventType,
+)
 from tuf.ngclient.urllib3_fetcher import Urllib3Fetcher
 
 if TYPE_CHECKING:
@@ -184,7 +199,11 @@ class Updater:
         filename = parse.quote(targetinfo.path, "")
         return os.path.join(self.target_dir, filename)
 
-    def get_targetinfo(self, target_path: str) -> TargetFile | None:
+    def get_targetinfo(
+        self,
+        target_path: str,
+        trace: TargetLookupTrace | None = None,
+    ) -> TargetFile | None:
         """Return ``TargetFile`` instance with information for ``target_path``.
 
         The return value can be used as an argument to
@@ -200,19 +219,34 @@ class Updater:
             target_path: `path-relative-URL string
                 <https://url.spec.whatwg.org/#path-relative-url-string>`_
                 that uniquely identifies the target within the repository.
+            trace: ``Optional`` :class:`TargetLookupTrace` recording the
+                structured delegation walk: every role visited, why branches
+                were skipped (path pattern or hash prefix miss, cycles,
+                terminating delegations, traversal limit) and any download or
+                metadata verification failure. Only verified edges are marked
+                trusted. The trace is single-use: pass a new instance for
+                every call. When omitted, lookup behavior is unchanged.
 
         Raises:
             OSError: New metadata could not be written to disk
             RepositoryError: Metadata failed to verify in some way
             DownloadError: Download of a metadata file failed in some way
+            ValueError: ``trace`` was already used by an earlier call
 
         Returns:
             ``TargetFile`` instance or ``None``.
         """
 
-        if Targets.type not in self._trusted_set:
-            self.refresh()
-        return self._preorder_depth_first_walk(target_path)
+        if trace is not None:
+            trace.begin(target_path)
+        try:
+            if Targets.type not in self._trusted_set:
+                self.refresh()
+            return self._preorder_depth_first_walk(target_path, trace)
+        except BaseException:
+            if trace is not None:
+                trace.seal(LookupOutcome.FAILED)
+            raise
 
     def find_cached_target(
         self,
@@ -505,7 +539,9 @@ class Updater:
             return delegated_targets
 
     def _preorder_depth_first_walk(
-        self, target_filepath: str
+        self,
+        target_filepath: str,
+        trace: TargetLookupTrace | None = None,
     ) -> TargetFile | None:
         """
         Interrogates the tree of target delegations in order of appearance
@@ -513,10 +549,18 @@ class Updater:
         target found in the most trusted role.
         """
 
-        # List of delegations to be interrogated. A (role, parent role) pair
-        # is needed to load and verify the delegated targets metadata.
-        delegations_to_visit = [(Targets.type, Root.type)]
+        # List of delegations to be interrogated. A (role, parent role,
+        # condition) tuple is needed to load and verify the delegated targets
+        # metadata and to explain why the role was selected.
+        delegations_to_visit: list[tuple[str, str, DelegationCondition]] = [
+            (
+                Targets.type,
+                Root.type,
+                DelegationCondition(kind="root"),
+            )
+        ]
         visited_role_names: set[str] = set()
+        truncated = False
 
         # Preorder depth-first traversal of the graph of target delegations.
         while (
@@ -524,55 +568,352 @@ class Updater:
             and len(delegations_to_visit) > 0
         ):
             # Pop the role name from the top of the stack.
-            role_name, parent_role = delegations_to_visit.pop(-1)
+            role_name, parent_role, condition = delegations_to_visit.pop(-1)
 
             # Skip any visited current role to prevent cycles.
             if role_name in visited_role_names:
-                logger.debug("Skipping visited current role %s", role_name)
+                self._handle_visited_role(
+                    role_name, parent_role, condition, trace
+                )
                 continue
 
             # The metadata for 'role_name' must be downloaded/updated before
             # its targets, delegations, and child roles can be inspected.
-            targets = self._load_targets(role_name, parent_role)
+            targets = self._load_traced_role(
+                role_name, parent_role, condition, trace
+            )
 
             target = targets.targets.get(target_filepath)
-
             if target is not None:
                 logger.debug("Found target in current role %s", role_name)
+                if trace is not None:
+                    trace.record(
+                        TraceEvent(
+                            TraceEventType.TARGET_FOUND,
+                            role_name,
+                            version=targets.version,
+                        )
+                    )
+                    trace.seal(LookupOutcome.TARGET_FOUND, role_name)
                 return target
 
             # After preorder check, add current role to set of visited roles.
             visited_role_names.add(role_name)
 
             if targets.delegations is not None:
-                child_roles_to_visit = []
-                # NOTE: This may be a slow operation if there are many
-                # delegated roles.
-                for (
-                    child_name,
-                    terminating,
-                ) in targets.delegations.get_roles_for_target(target_filepath):
-                    logger.debug("Adding child role %s", child_name)
-                    child_roles_to_visit.append((child_name, role_name))
-                    if terminating:
-                        logger.debug("Not backtracking to other roles")
-                        delegations_to_visit = []
-                        break
-                # Push 'child_roles_to_visit' in reverse order of appearance
-                # onto 'delegations_to_visit'.  Roles are popped from the end of
-                # the list.
-                child_roles_to_visit.reverse()
-                delegations_to_visit.extend(child_roles_to_visit)
+                if trace is not None:
+                    self._record_delegation_misses(
+                        targets.delegations,
+                        target_filepath,
+                        role_name,
+                        trace,
+                    )
+                children, terminating = self._child_roles_to_visit(
+                    targets.delegations, target_filepath, role_name
+                )
+                if terminating is not None:
+                    truncated = True
+                    if trace is not None:
+                        self._record_terminating_truncation(
+                            terminating,
+                            delegations_to_visit,
+                            children,
+                            role_name,
+                            trace,
+                        )
+                    delegations_to_visit = []
+                # Push children in reverse order of appearance onto the
+                # stack: roles are popped from the end of the list.
+                delegations_to_visit.extend(reversed(children))
 
-        if len(delegations_to_visit) > 0:
-            logger.debug(
-                "%d roles left to visit, but allowed at most %d delegations",
-                len(delegations_to_visit),
-                self.config.max_delegations,
+        truncated |= self._handle_traversal_limit(delegations_to_visit, trace)
+
+        if trace is not None:
+            outcome = (
+                LookupOutcome.NOT_FOUND_TRUNCATED
+                if truncated
+                else LookupOutcome.NOT_FOUND_EXHAUSTED
             )
+            trace.seal(outcome)
 
         # If this point is reached then target is not found, return None
         return None
+
+    def _handle_visited_role(
+        self,
+        role_name: str,
+        parent_role: str,
+        condition: DelegationCondition,
+        trace: TargetLookupTrace | None,
+    ) -> None:
+        """Record a role skipped by cycle protection, if tracing.
+
+        A cycle is not a truncation: the role was already checked through
+        another edge, so every reachable branch can still be evaluated.
+        """
+        logger.debug("Skipping visited current role %s", role_name)
+        if trace is not None:
+            trace.record(
+                TraceEvent(
+                    TraceEventType.ROLE_ALREADY_VISITED,
+                    role_name,
+                    parent_role,
+                    condition=condition,
+                )
+            )
+
+    def _load_traced_role(
+        self,
+        role_name: str,
+        parent_role: str,
+        condition: DelegationCondition,
+        trace: TargetLookupTrace | None,
+    ) -> Targets:
+        """Load role metadata and record the outcome on the trace.
+
+        Download and verification failures are recorded before being re-raised
+        so the trace never presents an unverified role as trusted.
+        """
+        from_cache = self._trusted_set.contains(role_name, parent_role)
+        try:
+            targets = self._load_targets(role_name, parent_role)
+        except exceptions.DownloadError as e:
+            if trace is not None:
+                trace.record(
+                    TraceEvent(
+                        TraceEventType.DOWNLOAD_FAILED,
+                        role_name,
+                        parent_role,
+                        condition=condition,
+                        error=str(e),
+                    )
+                )
+            raise
+        except exceptions.RepositoryError as e:
+            if trace is not None:
+                trace.record(
+                    TraceEvent(
+                        TraceEventType.SIGNATURE_FAILED,
+                        role_name,
+                        parent_role,
+                        condition=condition,
+                        error=str(e),
+                    )
+                )
+            raise
+
+        if trace is not None:
+            trace.record(
+                TraceEvent(
+                    TraceEventType.ROLE_VERIFIED,
+                    role_name,
+                    parent_role,
+                    trusted=True,
+                    condition=condition,
+                    version=targets.version,
+                    from_cache=from_cache,
+                )
+            )
+        return targets
+
+    def _child_roles_to_visit(
+        self,
+        delegations: Delegations,
+        target_filepath: str,
+        parent_role: str,
+    ) -> tuple[
+        list[tuple[str, str, DelegationCondition]],
+        tuple[str, str, DelegationCondition] | None,
+    ]:
+        """Return ordered child edges and the terminating edge, if any.
+
+        Only the in-memory parent metadata is inspected, so this performs no
+        download and visits no additional role.
+        """
+        children: list[tuple[str, str, DelegationCondition]] = []
+        terminating: tuple[str, str, DelegationCondition] | None = None
+        # NOTE: This may be a slow operation if there are many delegated roles.
+        for (
+            child_name,
+            is_terminating,
+            child_condition,
+        ) in self._get_roles_for_target(delegations, target_filepath):
+            logger.debug("Adding child role %s", child_name)
+            edge = (child_name, parent_role, child_condition)
+            children.append(edge)
+            if is_terminating:
+                logger.debug("Not backtracking to other roles")
+                terminating = edge
+                break
+        return children, terminating
+
+    def _record_terminating_truncation(
+        self,
+        terminating: tuple[str, str, DelegationCondition],
+        delegations_to_visit: list[tuple[str, str, DelegationCondition]],
+        children: list[tuple[str, str, DelegationCondition]],
+        parent_role: str,
+        trace: TargetLookupTrace,
+    ) -> None:
+        """Record the terminating edge and the candidates it removes.
+
+        Roles still on the stack and matching siblings not enumerated yet are
+        never evaluated; they are listed but not marked as visited or trusted.
+        """
+        child_name, _, child_condition = terminating
+        skipped = [name for name, _, _ in delegations_to_visit]
+        skipped.extend(name for name, _, _ in children if name != child_name)
+        trace.record(
+            TraceEvent(
+                TraceEventType.TERMINATING_TRUNCATION,
+                child_name,
+                parent_role,
+                condition=child_condition,
+                skipped_roles=tuple(skipped),
+            )
+        )
+
+    def _handle_traversal_limit(
+        self,
+        delegations_to_visit: list[tuple[str, str, DelegationCondition]],
+        trace: TargetLookupTrace | None,
+    ) -> bool:
+        """Record unvisited roles when the delegation limit is reached.
+
+        Returns whether the walk was truncated.
+        """
+        if not delegations_to_visit:
+            return False
+        logger.debug(
+            "%d roles left to visit, but allowed at most %d delegations",
+            len(delegations_to_visit),
+            self.config.max_delegations,
+        )
+        if trace is not None:
+            trace.record(
+                TraceEvent(
+                    TraceEventType.MAX_DELEGATIONS_REACHED,
+                    delegations_to_visit[-1][0],
+                    skipped_roles=tuple(
+                        name for name, _, _ in delegations_to_visit
+                    ),
+                )
+            )
+        return True
+
+    def _get_roles_for_target(
+        self,
+        delegations: Delegations,
+        target_filepath: str,
+    ) -> list[tuple[str, bool, DelegationCondition]]:
+        """Return matching child roles with the adopted delegation condition.
+
+        Mirrors ``Delegations.get_roles_for_target`` but additionally returns
+        the condition that made each child a candidate, so a trace can explain
+        the edge. Only in-memory metadata is inspected: this performs no
+        downloads and visits no additional roles.
+        """
+        results: list[tuple[str, bool, DelegationCondition]] = []
+
+        if delegations.roles is not None:
+            digest = hashlib.sha256(target_filepath.encode()).hexdigest()
+            for role in delegations.roles.values():
+                if role.paths is not None:
+                    matched = next(
+                        (
+                            pattern
+                            for pattern in role.paths
+                            if role.matches_path_pattern(
+                                target_filepath, pattern
+                            )
+                        ),
+                        None,
+                    )
+                    if matched is None:
+                        continue
+                    condition = DelegationCondition(
+                        kind="paths",
+                        terminating=role.terminating,
+                        paths=tuple(role.paths),
+                        matched_path=matched,
+                    )
+                else:
+                    prefixes = role.path_hash_prefixes or []
+                    matched_prefix = next(
+                        (
+                            prefix
+                            for prefix in prefixes
+                            if digest.startswith(prefix)
+                        ),
+                        None,
+                    )
+                    if matched_prefix is None:
+                        continue
+                    condition = DelegationCondition(
+                        kind="path_hash_prefixes",
+                        terminating=role.terminating,
+                        path_hash_prefixes=tuple(prefixes),
+                        matched_prefix=matched_prefix,
+                    )
+                results.append((role.name, role.terminating, condition))
+
+        elif delegations.succinct_roles is not None:
+            succinct = delegations.succinct_roles
+            bin_name = succinct.get_role_for_target(target_filepath)
+            # All succinct roles are treated as terminating (see TAP 15).
+            condition = DelegationCondition(
+                kind="succinct_roles",
+                terminating=True,
+                name_prefix=succinct.name_prefix,
+                bit_length=succinct.bit_length,
+                bin=bin_name,
+            )
+            results.append((bin_name, True, condition))
+
+        return results
+
+    def _record_delegation_misses(
+        self,
+        delegations: Delegations,
+        target_filepath: str,
+        parent_role: str,
+        trace: TargetLookupTrace,
+    ) -> None:
+        """Record roles whose delegation condition did not match.
+
+        Only delegations present in the already loaded parent metadata are
+        evaluated: a miss event means the role was never a candidate and its
+        metadata must not be downloaded.
+        """
+        if delegations.roles is None:
+            # Succinct roles always assign a target to exactly one bin.
+            return
+
+        for role in delegations.roles.values():
+            if role.is_delegated_path(target_filepath):
+                continue
+            if role.paths is not None:
+                event_type = TraceEventType.PATH_PATTERN_MISS
+                condition = DelegationCondition(
+                    kind="paths",
+                    terminating=role.terminating,
+                    paths=tuple(role.paths),
+                )
+            else:
+                event_type = TraceEventType.HASH_PREFIX_MISS
+                condition = DelegationCondition(
+                    kind="path_hash_prefixes",
+                    terminating=role.terminating,
+                    path_hash_prefixes=tuple(role.path_hash_prefixes or ()),
+                )
+            trace.record(
+                TraceEvent(
+                    event_type,
+                    role.name,
+                    parent_role,
+                    condition=condition,
+                )
+            )
 
 
 def _ensure_trailing_slash(url: str) -> str:

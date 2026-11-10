@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+### Added
+
+* ngclient: `Updater.get_targetinfo()` now accepts an optional
+  `TargetLookupTrace` that records the structured delegation walk for one
+  lookup. The trace distinguishes path pattern misses, hash prefix misses,
+  already visited roles, terminating truncation, the traversal limit,
+  download failures and metadata verification failures; only verified edges
+  are marked trusted and the outcome says whether an unmet target means all
+  branches were checked. Lookup behavior without a trace is unchanged.
+
 ### Changed
 
 * Add Python 3.15 to tested versions, remove 3.10 from tested versions.

@@ -6,13 +6,25 @@
 from tuf.api.metadata import TargetFile
 from tuf.ngclient.config import UpdaterConfig
 from tuf.ngclient.fetcher import FetcherInterface
+from tuf.ngclient.trace import (
+    DelegationCondition,
+    LookupOutcome,
+    TargetLookupTrace,
+    TraceEvent,
+    TraceEventType,
+)
 from tuf.ngclient.updater import Updater
 from tuf.ngclient.urllib3_fetcher import Urllib3Fetcher
 
 __all__ = [  # noqa: PLE0604
+    DelegationCondition.__name__,
     FetcherInterface.__name__,
-    Urllib3Fetcher.__name__,
+    LookupOutcome.__name__,
     TargetFile.__name__,
+    TargetLookupTrace.__name__,
+    TraceEvent.__name__,
+    TraceEventType.__name__,
     Updater.__name__,
     UpdaterConfig.__name__,
+    Urllib3Fetcher.__name__,
 ]

@@ -1194,6 +1194,17 @@ class DelegatedRole(Role):
 
         return True
 
+    @classmethod
+    def matches_path_pattern(
+        cls, target_filepath: str, pathpattern: str
+    ) -> bool:
+        """Determine whether ``target_filepath`` matches ``pathpattern``.
+
+        Like :meth:`is_delegated_path` but for a single path pattern, allowing
+        callers to identify the specific pattern that delegated a target.
+        """
+        return cls._is_target_in_pathpattern(target_filepath, pathpattern)
+
     def is_delegated_path(self, target_filepath: str) -> bool:
         """Determine whether the given ``target_filepath`` is in one of
         the paths that ``DelegatedRole`` is trusted to provide.
