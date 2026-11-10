@@ -6,13 +6,23 @@
 from tuf.api.metadata import TargetFile
 from tuf.ngclient.config import UpdaterConfig
 from tuf.ngclient.fetcher import FetcherInterface
+from tuf.ngclient.mirror_fetcher import (
+    AttemptRecord,
+    CrossOriginRedirectError,
+    Mirror,
+    MirrorFetcher,
+)
 from tuf.ngclient.updater import Updater
 from tuf.ngclient.urllib3_fetcher import Urllib3Fetcher
 
 __all__ = [  # noqa: PLE0604
+    AttemptRecord.__name__,
+    CrossOriginRedirectError.__name__,
     FetcherInterface.__name__,
-    Urllib3Fetcher.__name__,
+    Mirror.__name__,
+    MirrorFetcher.__name__,
     TargetFile.__name__,
     Updater.__name__,
     UpdaterConfig.__name__,
+    Urllib3Fetcher.__name__,
 ]

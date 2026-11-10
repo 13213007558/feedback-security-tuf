@@ -11,6 +11,18 @@ implementers can implement a concrete class of in order to reuse their
 own networking/download libraries -- a Requests-based implementation is
 used by default.
 
+**tuf.ngclient.MirrorFetcher** is a composable fetcher for repositories
+served by multiple static mirrors. The mirror URLs are fixed in client
+configuration: the authority of a requested URL is ignored and replaced
+by the configured mirror prefixes, so metadata content cannot introduce
+new hosts. A logical file is retried on another mirror after connection
+failures, timeouts or configured HTTP statuses, within bounds on the
+number of attempts and cumulative bytes. Cross-origin redirects are
+rejected by default and every attempt independently enforces the
+caller's length limit. Signature, version and digest verification remain
+in `Updater`: downloaded-but-invalid content fails as a security error
+instead of being hidden by mirror rotation.
+
 This package:
 * Aims to be a clean, easy-to-validate reference client implementation
   written in modern Python
