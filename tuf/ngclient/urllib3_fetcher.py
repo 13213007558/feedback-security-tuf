@@ -8,6 +8,7 @@ library.
 from __future__ import annotations
 
 import logging
+import re
 from typing import TYPE_CHECKING
 
 # Imports
@@ -16,13 +17,17 @@ import urllib3
 import tuf
 from tuf.api import exceptions
 from tuf.ngclient._internal.proxy import ProxyEnvironment
-from tuf.ngclient.fetcher import FetcherInterface
+from tuf.ngclient.fetcher import FetcherInterface, RangeResponse
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
 
 # Globals
 logger = logging.getLogger(__name__)
+
+# Content-Range header for a single byte range: "bytes START-END/TOTAL"
+# where TOTAL may be "*"
+_CONTENT_RANGE_RE = re.compile(r"bytes (\d+)-(\d+)/(\d+|\*)")
 
 
 # Classes
@@ -119,3 +124,86 @@ class Urllib3Fetcher(FetcherInterface):
 
         finally:
             response.release_conn()
+
+    def _fetch_range(
+        self, url: str, start: int, end: int, etag: str | None = None
+    ) -> RangeResponse:
+        """Fetch the bytes in range [start, end] of url from a remote server.
+
+        Args:
+            url: URL string that represents a file location.
+            start: First byte position to fetch (0-based, inclusive).
+            end: Last byte position to fetch (inclusive).
+            etag: Optional ETag to make the request conditional (If-Match).
+
+        Raises:
+            exceptions.SlowRetrievalError: Timeout occurs while receiving
+                data.
+            exceptions.DownloadHTTPError: HTTP error code is received
+                (e.g. 412 or 416).
+            exceptions.DownloadError: The 206 response lacks a valid
+                Content-Range header.
+
+        Returns:
+            ``RangeResponse`` with a 206 partial or 200 full response.
+        """
+        headers = {"Range": f"bytes={start}-{end}"}
+        if etag is not None:
+            headers["If-Match"] = etag
+
+        try:
+            response = self._proxy_env.request(
+                "GET",
+                url,
+                headers=headers,
+                preload_content=False,
+                timeout=urllib3.Timeout(self.socket_timeout),
+            )
+        except urllib3.exceptions.MaxRetryError as e:
+            if isinstance(e.reason, urllib3.exceptions.TimeoutError):
+                raise exceptions.SlowRetrievalError from e
+            raise
+
+        if response.status >= 400:
+            status = response.status
+            response.close()
+            raise exceptions.DownloadHTTPError(
+                f"HTTP error occurred with status {status}", status
+            )
+
+        if response.status not in (200, 206):
+            status = response.status
+            response.close()
+            raise exceptions.DownloadError(
+                f"Unexpected status {status} for range request on {url}"
+            )
+
+        result = RangeResponse(
+            status_code=response.status,
+            chunks=self._chunks(response),
+            etag=response.headers.get("ETag"),
+        )
+        if response.status == 200:
+            content_length = response.headers.get("Content-Length")
+            if content_length is not None:
+                result.total_length = int(content_length)
+            return result
+
+        # 206 partial content: parse "Content-Range: bytes START-END/TOTAL"
+        content_range = response.headers.get("Content-Range")
+        match = (
+            None
+            if content_range is None
+            else _CONTENT_RANGE_RE.fullmatch(content_range.strip())
+        )
+        if match is None:
+            response.close()
+            raise exceptions.DownloadError(
+                f"Missing or invalid Content-Range header "
+                f"{content_range!r} for {url}"
+            )
+        result.range_start = int(match.group(1))
+        result.range_end = int(match.group(2))
+        if match.group(3) != "*":
+            result.total_length = int(match.group(3))
+        return result

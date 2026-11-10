@@ -65,6 +65,7 @@ from urllib import parse
 
 from tuf.api import exceptions
 from tuf.api.metadata import Root, Snapshot, TargetFile, Targets, Timestamp
+from tuf.ngclient._internal.resume import download_target_file
 from tuf.ngclient._internal.trusted_metadata_set import TrustedMetadataSet
 from tuf.ngclient.config import EnvelopeType, UpdaterConfig
 from tuf.ngclient.urllib3_fetcher import Urllib3Fetcher
@@ -249,6 +250,8 @@ class Updater:
         targetinfo: TargetFile,
         filepath: str | None = None,
         target_base_url: str | None = None,
+        *,
+        resume: bool = False,
     ) -> str:
         """Download the target file specified by ``targetinfo``.
 
@@ -260,6 +263,12 @@ class Updater:
                 it is overwritten.
             target_base_url: Base URL used to form the final target
                 download URL. Default is the value provided in ``Updater()``
+            resume: Enable resumable download: interrupted downloads are
+                continued from a partial file (``<filepath>.part``) that is
+                bound to the target path, length and hashes. The final file
+                is still only written after full verification against
+                ``targetinfo``. Fetchers without range request support
+                download the whole file instead.
 
         Raises:
             ValueError: Invalid arguments
@@ -293,6 +302,11 @@ class Updater:
             dirname, sep, basename = target_filepath.rpartition("/")
             target_filepath = f"{dirname}{sep}{hashes[0]}.{basename}"
         full_url = f"{target_base_url}{target_filepath}"
+
+        if resume:
+            download_target_file(self._fetcher, targetinfo, full_url, filepath)
+            logger.debug("Downloaded target %s", targetinfo.path)
+            return filepath
 
         with self._fetcher.download_file(
             full_url, targetinfo.length
