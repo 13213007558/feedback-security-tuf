@@ -43,6 +43,16 @@ class UpdaterConfig:
             -based TUF Metadata.
         app_user_agent: Application user agent, e.g. "MyApp/1.0.0". This will be
             prefixed to ngclient user agent when the default fetcher is used.
+        generation_store: Store top-level metadata in generations so that
+            the timestamp, snapshot and targets metadata of one ``refresh()``
+            only become visible as a complete, version-consistent set. A
+            process exiting mid-refresh then cannot leave a half-written
+            set behind that a later process would mistake for valid cache.
+            Enabling this on a legacy (flat) metadata directory migrates
+            it on first use. Root metadata is not generational: verified
+            root versions are append-only and never regress. Intended for
+            a single writing process with any number of read-only
+            processes; concurrent writers are not supported.
     """
 
     max_root_rotations: int = 256
@@ -54,3 +64,4 @@ class UpdaterConfig:
     prefix_targets_with_hash: bool = True
     envelope_type: EnvelopeType = EnvelopeType.METADATA
     app_user_agent: str | None = None
+    generation_store: bool = False

@@ -65,6 +65,7 @@ from urllib import parse
 
 from tuf.api import exceptions
 from tuf.api.metadata import Root, Snapshot, TargetFile, Targets, Timestamp
+from tuf.ngclient._internal.generation_store import GenerationStore
 from tuf.ngclient._internal.trusted_metadata_set import TrustedMetadataSet
 from tuf.ngclient.config import EnvelopeType, UpdaterConfig
 from tuf.ngclient.urllib3_fetcher import Urllib3Fetcher
@@ -136,6 +137,10 @@ class Updater:
                 f"got '{self.config.envelope_type}'"
             )
 
+        # The generation store is only set up after the trusted root is
+        # loaded: root metadata is not part of a generation
+        self._generation_store: GenerationStore | None = None
+
         if bootstrap is None:
             # if no root was provided, use the cached non-versioned root.json
             bootstrap = self._load_local_metadata(Root.type)
@@ -146,6 +151,13 @@ class Updater:
         )
         self._persist_root(self._trusted_set.root.version, bootstrap)
         self._update_root_symlink()
+
+        if self.config.generation_store:
+            self._generation_store = GenerationStore(self._dir)
+            # migrate a legacy flat layout on first use, then make sure
+            # the committed generation (if any) is complete and
+            # version-consistent before anything reads from it
+            self._generation_store.initialize()
 
     def refresh(self) -> None:
         """Refresh top-level metadata.
@@ -171,10 +183,24 @@ class Updater:
             DownloadError: Download of a metadata file failed in some way
         """
 
-        self._load_root()
-        self._load_timestamp()
-        self._load_snapshot()
-        self._load_targets(Targets.type, Root.type)
+        store = self._generation_store
+        if store is not None:
+            store.begin()
+        try:
+            self._load_root()
+            self._load_timestamp()
+            self._load_snapshot()
+            self._load_targets(Targets.type, Root.type)
+        except Exception:
+            # The pending generation is discarded: the previously
+            # committed generation remains the current one. Root versions
+            # persisted into root_history are kept: root trust is
+            # monotonic and must not regress on a failed refresh.
+            if store is not None:
+                store.abort()
+            raise
+        if store is not None:
+            store.commit()
 
     def _generate_target_file_path(self, targetinfo: TargetFile) -> str:
         if self.target_dir is None:
@@ -318,6 +344,8 @@ class Updater:
         return self._fetcher.download_bytes(url, length)
 
     def _load_local_metadata(self, rolename: str) -> bytes:
+        if self._generation_store is not None:
+            return self._generation_store.load(rolename)
         encoded_name = parse.quote(rolename, "")
         with open(os.path.join(self._dir, f"{encoded_name}.json"), "rb") as f:
             return f.read()
@@ -329,6 +357,9 @@ class Updater:
         . Encode the rolename to avoid issues with e.g. path separators
         """
 
+        if self._generation_store is not None:
+            self._generation_store.persist(rolename, data)
+            return
         encoded_name = parse.quote(rolename, "")
         filename = os.path.join(self._dir, f"{encoded_name}.json")
         self._persist_file(filename, data)
