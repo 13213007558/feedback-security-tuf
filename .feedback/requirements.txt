@@ -1,0 +1,13 @@
+cffi==2.1.1
+cryptography==50.0.2
+freezegun==1.5.5
+iniconfig==2.3.1
+packaging==26.3
+pluggy==1.7.0
+pycparser==3.12
+pygments==2.21.0
+pytest==9.2.0
+python-dateutil==4.0.0
+securesystemslib==1.6.0
+tzdata==2026.6
+urllib3==2.8.0
